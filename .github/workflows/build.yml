@@ -1,0 +1,86 @@
+name: Build APK
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Siapkan proyek
+        shell: bash
+        run: |
+          shopt -s nullglob
+          mkdir -p _zip
+          for z in *.zip; do
+            n="${z%.zip}"
+            echo "Ekstrak $z"
+            unzip -o -q "$z" -d "_zip/$n"
+          done
+
+          # Pilih proyek terbaru: harus punya BackgroundRemover, lalu versionCode tertinggi
+          BEST=""; BESTV=-1
+          while IFS= read -r s; do
+            d=$(dirname "$s")
+            if grep -rqs "object BackgroundRemover" "$d/app/src" 2>/dev/null; then
+              v=$(grep -oE 'versionCode *= *[0-9]+' "$d/app/build.gradle.kts" 2>/dev/null | grep -oE '[0-9]+' | head -1)
+              v=${v:-0}
+              echo "Kandidat: $d (versionCode $v)"
+              if [ "$v" -gt "$BESTV" ]; then BEST="$d"; BESTV="$v"; fi
+            else
+              echo "Dilewati (tanpa BackgroundRemover): $d"
+            fi
+          done < <(find . -name 'settings.gradle.kts' -not -path './.git/*' -not -path '*/build/*')
+
+          if [ -z "$BEST" ]; then
+            echo "::error::Proyek dengan BackgroundRemover tidak ditemukan. Periksa isi repo/ZIP."
+            exit 1
+          fi
+          echo "Proyek dipakai: $BEST"
+          echo "PROJ=$BEST" >> "$GITHUB_ENV"
+
+          # ML Kit / Play services membawa dependensi AndroidX
+          if [ ! -f "$BEST/gradle.properties" ]; then
+            printf '%s\n' \
+              'org.gradle.jvmargs=-Xmx3g -Dfile.encoding=UTF-8' \
+              'android.useAndroidX=true' \
+              'android.nonTransitiveRClass=true' \
+              'kotlin.code.style=official' > "$BEST/gradle.properties"
+          elif ! grep -q 'android.useAndroidX' "$BEST/gradle.properties"; then
+            printf '\nandroid.useAndroidX=true\n' >> "$BEST/gradle.properties"
+          fi
+
+      - name: Setup JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Terima lisensi Android SDK
+        shell: bash
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Build debug APK
+        working-directory: ${{ env.PROJ }}
+        run: gradle assembleDebug --stacktrace --no-daemon
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: JPGtoSketsa-apk
+          path: ${{ env.PROJ }}/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
